@@ -15,6 +15,7 @@ import {
   ToolCallConfirmationDetails,
   ToolExecuteConfirmationDetails,
   ToolConfirmationOutcome,
+  ToolPasswordConfirmationDetails,
 } from './tools.js';
 import { SchemaValidator } from '../utils/schemaValidator.js';
 import { getErrorMessage } from '../utils/errors.js';
@@ -25,13 +26,17 @@ export interface ShellToolParams {
   description?: string;
   directory?: string;
 }
-import { spawn } from 'child_process';
+import { spawn, SpawnOptions } from 'child_process';
 
 const OUTPUT_UPDATE_INTERVAL_MS = 1000;
 
 export class ShellTool extends BaseTool<ShellToolParams, ToolResult> {
   static Name: string = 'run_shell_command';
   private whitelist: Set<string> = new Set();
+
+  private sudoPassword?: string;
+  private sudoPasswordTimestamp?: number;
+  private readonly SUDO_CACHE_DURATION_MS = 15 * 60 * 1000; // 15 minutes
 
   constructor(private readonly config: Config) {
     super(
@@ -237,6 +242,30 @@ Process Group PGID: Process group started or \`(none)\``,
       return false; // skip confirmation, execute call will fail immediately
     }
     const rootCommand = this.getCommandRoot(params.command)!; // must be non-empty string post-validation
+
+    const isSudo = params.command.trim().startsWith('sudo ');
+    const isWindows = os.platform() === 'win32';
+    if (isSudo && !isWindows) {
+      const isPasswordCached =
+        this.sudoPassword &&
+        this.sudoPasswordTimestamp &&
+        Date.now() - this.sudoPasswordTimestamp < this.SUDO_CACHE_DURATION_MS;
+
+      if (!isPasswordCached) {
+        // Password is required but not cached, so we prompt the user.
+        const confirmationDetails: ToolPasswordConfirmationDetails = {
+          type: 'password',
+          title: 'Sudo Password Required',
+          rootCommand: 'sudo',
+          onConfirm: async (password: string) => {
+            this.sudoPassword = password;
+            this.sudoPasswordTimestamp = Date.now();
+          },
+        };
+        return confirmationDetails;
+      }
+    }
+
     if (this.whitelist.has(rootCommand)) {
       return false; // already approved and whitelisted
     }
@@ -278,33 +307,58 @@ Process Group PGID: Process group started or \`(none)\``,
     }
 
     const isWindows = os.platform() === 'win32';
+    const isSudoCommand = !isWindows && params.command.trim().startsWith('sudo ');
+    let commandToExecute = params.command;
+
+    const spawnOptions: SpawnOptions = {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: !isWindows,
+      cwd: path.resolve(this.config.getTargetDir(), params.directory || ''),
+    };
+
+    if (isSudoCommand) {
+      const isPasswordCached =
+        this.sudoPassword &&
+        this.sudoPasswordTimestamp &&
+        Date.now() - this.sudoPasswordTimestamp < this.SUDO_CACHE_DURATION_MS;
+
+      if (!isPasswordCached) {
+        return {
+          llmContent:
+            'Sudo command rejected: password has not been provided or has expired.',
+          returnDisplay: 'Error: Sudo password required.',
+        };
+      }
+      // Replace "sudo" with "sudo -S" and prepare to pipe the password
+      commandToExecute = 'sudo -S ' + params.command.trim().substring(5);
+      spawnOptions.stdio = ['pipe', 'pipe', 'pipe'];
+    }
+
     const tempFileName = `shell_pgrep_${crypto
       .randomBytes(6)
       .toString('hex')}.tmp`;
     const tempFilePath = path.join(os.tmpdir(), tempFileName);
 
     // pgrep is not available on Windows, so we can't get background PIDs
+    // FIX: Use `commandToExecute` here so the `sudo -S` version is used.
     const command = isWindows
-      ? params.command
+      ? commandToExecute
       : (() => {
-          // wrap command to append subprocess pids (via pgrep) to temporary file
-          let command = params.command.trim();
-          if (!command.endsWith('&')) command += ';';
-          return `{ ${command} }; __code=$?; pgrep -g 0 >${tempFilePath} 2>&1; exit $__code;`;
+          let cmd = commandToExecute.trim();
+          if (!cmd.endsWith('&')) cmd += ';';
+          return `{ ${cmd} }; __code=$?; pgrep -g 0 >${tempFilePath} 2>&1; exit $__code;`;
         })();
 
-    // spawn command in specified directory (or project root if not specified)
+    // FIX: Pass the configured `spawnOptions` to the spawn call.
     const shell = isWindows
-      ? spawn('cmd.exe', ['/c', command], {
-          stdio: ['ignore', 'pipe', 'pipe'],
-          // detached: true, // ensure subprocess starts its own process group (esp. in Linux)
-          cwd: path.resolve(this.config.getTargetDir(), params.directory || ''),
-        })
-      : spawn('bash', ['-c', command], {
-          stdio: ['ignore', 'pipe', 'pipe'],
-          detached: true, // ensure subprocess starts its own process group (esp. in Linux)
-          cwd: path.resolve(this.config.getTargetDir(), params.directory || ''),
-        });
+      ? spawn('cmd.exe', ['/c', command], spawnOptions)
+      : spawn('bash', ['-c', command], spawnOptions);
+
+    // FIX: Pipe the password to stdin for sudo commands.
+    if (isSudoCommand && shell.stdin) {
+      shell.stdin.write(this.sudoPassword + '\n');
+      shell.stdin.end();
+    }
 
     let exited = false;
     let stdout = '';
@@ -322,25 +376,26 @@ Process Group PGID: Process group started or \`(none)\``,
       }
     };
 
-    shell.stdout.on('data', (data: Buffer) => {
-      // continue to consume post-exit for background processes
-      // removing listeners can overflow OS buffer and block subprocesses
-      // destroying (e.g. shell.stdout.destroy()) can terminate subprocesses via SIGPIPE
-      if (!exited) {
-        const str = stripAnsi(data.toString());
-        stdout += str;
-        appendOutput(str);
-      }
-    });
+    if (shell.stdout) {
+      shell.stdout.on('data', (data: Buffer) => {
+        if (!exited) {
+          const str = stripAnsi(data.toString());
+          stdout += str;
+          appendOutput(str);
+        }
+      });
+    }
 
     let stderr = '';
-    shell.stderr.on('data', (data: Buffer) => {
-      if (!exited) {
-        const str = stripAnsi(data.toString());
-        stderr += str;
-        appendOutput(str);
-      }
-    });
+    if (shell.stderr) {
+      shell.stderr.on('data', (data: Buffer) => {
+        if (!exited) {
+          const str = stripAnsi(data.toString());
+          stderr += str;
+          appendOutput(str);
+        }
+      });
+    }
 
     let error: Error | null = null;
     shell.on('error', (err: Error) => {

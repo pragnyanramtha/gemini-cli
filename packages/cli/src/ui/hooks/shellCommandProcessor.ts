@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { spawn } from 'child_process';
+import { spawn, SpawnOptions } from 'child_process';
 import { StringDecoder } from 'string_decoder';
 import type { HistoryItemWithoutId } from '../types.js';
 import { useCallback } from 'react';
@@ -18,6 +18,7 @@ import path from 'path';
 import os from 'os';
 import fs from 'fs';
 import stripAnsi from 'strip-ansi';
+import { useSudo } from '../contexts/SudoContext.js';
 
 const OUTPUT_UPDATE_INTERVAL_MS = 1000;
 const MAX_OUTPUT_LENGTH = 10000;
@@ -32,38 +33,86 @@ interface ShellExecutionResult {
   signal: NodeJS.Signals | null;
   error: Error | null;
   aborted: boolean;
+  finalPwd?: string;
 }
 
 /**
  * Executes a shell command using `spawn`, capturing all output and lifecycle events.
  * This is the single, unified implementation for shell execution.
  *
- * @param commandToExecute The exact command string to run.
+ * @param rawCommand The exact command string to run.
  * @param cwd The working directory to execute the command in.
  * @param abortSignal An AbortSignal to terminate the process.
  * @param onOutputChunk A callback for streaming real-time output.
  * @param onDebugMessage A callback for logging debug information.
+ * @param sudoPassword An optional password for sudo commands.
  * @returns A promise that resolves with the complete execution result.
  */
 function executeShellCommand(
-  commandToExecute: string,
+  rawCommand: string,
   cwd: string,
   abortSignal: AbortSignal,
   onOutputChunk: (chunk: string) => void,
   onDebugMessage: (message: string) => void,
+  sudoPassword?: string,
 ): Promise<ShellExecutionResult> {
   return new Promise((resolve) => {
     const isWindows = os.platform() === 'win32';
-    const shell = isWindows ? 'cmd.exe' : 'bash';
-    const shellArgs = isWindows
-      ? ['/c', commandToExecute]
-      : ['-c', commandToExecute];
+    const isSudo = !isWindows && rawCommand.trim().startsWith('sudo ');
+    let commandToExecute = rawCommand;
 
-    const child = spawn(shell, shellArgs, {
+    const spawnOptions: SpawnOptions = {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
-      detached: !isWindows, // Use process groups on non-Windows for robust killing
-    });
+      detached: !isWindows,
+    };
+
+    if (isSudo) {
+      if (!sudoPassword) {
+        // If sudo is used without a password, resolve immediately with an error.
+        resolve({
+          rawOutput: Buffer.from(''),
+          output:
+            'Error: sudo password required, but not provided or has expired.\nRun a sudo command through the AI first to cache the password.',
+          exitCode: 1,
+          signal: null,
+          error: new Error('Sudo password required.'),
+          aborted: false,
+        });
+        return;
+      }
+      // Modify command and stdio for password piping.
+      commandToExecute = 'sudo -S ' + rawCommand.trim().substring(5);
+      spawnOptions.stdio = ['pipe', 'pipe', 'pipe'];
+    }
+
+    // On non-windows, wrap the command to capture the final working directory.
+    let finalWrappedCommand = commandToExecute;
+    let pwdFilePath: string | undefined;
+    if (!isWindows) {
+      let command = commandToExecute.trim();
+      const pwdFileName = `shell_pwd_${crypto.randomBytes(6).toString('hex')}.tmp`;
+      pwdFilePath = path.join(os.tmpdir(), pwdFileName);
+      // Ensure command ends with a separator before adding our own.
+      if (!command.endsWith(';') && !command.endsWith('&')) {
+        command += ';';
+      }
+      finalWrappedCommand = `{ ${command} }; __code=$?; pwd > "${pwdFilePath}"; exit $__code`;
+    }
+
+    const shell = isWindows ? 'cmd.exe' : 'bash';
+    const shellArgs = isWindows
+      ? ['/c', finalWrappedCommand]
+      : ['-c', finalWrappedCommand];
+
+    onDebugMessage(`Executing in ${cwd}: ${finalWrappedCommand}`);
+    const child = spawn(shell, shellArgs, spawnOptions);
+
+    // Pipe the password to stdin if this is a sudo command.
+    if (isSudo && child.stdin) {
+      child.stdin.write(sudoPassword + '\n');
+      child.stdin.end();
+    }
 
     // Use decoders to handle multi-byte characters safely (for streaming output).
     const stdoutDecoder = new StringDecoder('utf8');
@@ -120,8 +169,12 @@ function executeShellCommand(
       }
     };
 
-    child.stdout.on('data', (data) => handleOutput(data, 'stdout'));
-    child.stderr.on('data', (data) => handleOutput(data, 'stderr'));
+    if (child.stdout) {
+      child.stdout.on('data', (data) => handleOutput(data, 'stdout'));
+    }
+    if (child.stderr) {
+      child.stderr.on('data', (data) => handleOutput(data, 'stderr'));
+    }
     child.on('error', (err) => {
       error = err;
     });
@@ -160,6 +213,13 @@ function executeShellCommand(
 
       const finalBuffer = Buffer.concat(outputChunks);
 
+      // Check for and clean up the pwd file
+      let finalPwd: string | undefined;
+      if (pwdFilePath && fs.existsSync(pwdFilePath)) {
+        finalPwd = fs.readFileSync(pwdFilePath, 'utf8').trim();
+        fs.unlinkSync(pwdFilePath);
+      }
+
       resolve({
         rawOutput: finalBuffer,
         output: stdout + (stderr ? `\n${stderr}` : ''),
@@ -167,6 +227,7 @@ function executeShellCommand(
         signal,
         error,
         aborted: abortSignal.aborted,
+        finalPwd,
       });
     });
   });
@@ -214,6 +275,8 @@ export const useShellCommandProcessor = (
   config: Config,
   geminiClient: GeminiClient,
 ) => {
+  const { getPassword: getSudoPassword } = useSudo();
+
   const handleShellCommand = useCallback(
     (rawQuery: PartListUnion, abortSignal: AbortSignal): boolean => {
       if (typeof rawQuery !== 'string' || rawQuery.trim() === '') {
@@ -226,29 +289,13 @@ export const useShellCommandProcessor = (
         userMessageTimestamp,
       );
 
-      const isWindows = os.platform() === 'win32';
       const targetDir = config.getTargetDir();
-      let commandToExecute = rawQuery;
-      let pwdFilePath: string | undefined;
-
-      // On non-windows, wrap the command to capture the final working directory.
-      if (!isWindows) {
-        let command = rawQuery.trim();
-        const pwdFileName = `shell_pwd_${crypto.randomBytes(6).toString('hex')}.tmp`;
-        pwdFilePath = path.join(os.tmpdir(), pwdFileName);
-        // Ensure command ends with a separator before adding our own.
-        if (!command.endsWith(';') && !command.endsWith('&')) {
-          command += ';';
-        }
-        commandToExecute = `{ ${command} }; __code=$?; pwd > "${pwdFilePath}"; exit $__code`;
-      }
 
       const execPromise = new Promise<void>((resolve) => {
         let lastUpdateTime = 0;
 
-        onDebugMessage(`Executing in ${targetDir}: ${commandToExecute}`);
         executeShellCommand(
-          commandToExecute,
+          rawQuery,
           targetDir,
           abortSignal,
           (streamedOutput) => {
@@ -259,18 +306,14 @@ export const useShellCommandProcessor = (
             }
           },
           onDebugMessage,
+          getSudoPassword(),
         )
           .then((result) => {
-            // TODO(abhipatel12) - Consider updating pending item and using timeout to ensure
-            // there is no jump where intermediate output is skipped.
             setPendingHistoryItem(null);
 
             let historyItemType: HistoryItemWithoutId['type'] = 'info';
             let mainContent: string;
 
-            // The context sent to the model utilizes a text tokenizer which means raw binary data is
-            // cannot be parsed and understood and thus would only pollute the context window and waste
-            // tokens.
             if (isBinary(result.rawOutput)) {
               mainContent =
                 '[Command produced binary output, which is not shown.]';
@@ -294,12 +337,9 @@ export const useShellCommandProcessor = (
               finalOutput = `Command exited with code ${result.exitCode}.\n${finalOutput}`;
             }
 
-            if (pwdFilePath && fs.existsSync(pwdFilePath)) {
-              const finalPwd = fs.readFileSync(pwdFilePath, 'utf8').trim();
-              if (finalPwd && finalPwd !== targetDir) {
-                const warning = `WARNING: shell mode is stateless; the directory change to '${finalPwd}' will not persist.`;
-                finalOutput = `${warning}\n\n${finalOutput}`;
-              }
+            if (result.finalPwd && result.finalPwd !== targetDir) {
+              const warning = `WARNING: shell mode is stateless; the directory change to '${result.finalPwd}' will not persist.`;
+              finalOutput = `${warning}\n\n${finalOutput}`;
             }
 
             // Add the complete, contextual result to the local UI history.
@@ -324,9 +364,6 @@ export const useShellCommandProcessor = (
             );
           })
           .finally(() => {
-            if (pwdFilePath && fs.existsSync(pwdFilePath)) {
-              fs.unlinkSync(pwdFilePath);
-            }
             resolve();
           });
       });
@@ -341,6 +378,7 @@ export const useShellCommandProcessor = (
       setPendingHistoryItem,
       onExec,
       geminiClient,
+      getSudoPassword,
     ],
   );
 
