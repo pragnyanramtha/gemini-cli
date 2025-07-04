@@ -4,12 +4,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import React from 'react';
 import { act, renderHook } from '@testing-library/react';
 import { vi } from 'vitest';
-import { useShellCommandProcessor } from './shellCommandProcessor';
+import { useShellCommandProcessor } from './shellCommandProcessor.js';
 import { Config, GeminiClient } from '@google/gemini-cli-core';
 import * as fs from 'fs';
-import EventEmitter from 'events';
+import { EventEmitter } from 'events';
+import { SudoProvider } from '../contexts/SudoContext.js';
 
 // Mock dependencies
 vi.mock('child_process');
@@ -28,7 +30,11 @@ vi.mock('../utils/textUtils.js', () => ({
 }));
 
 describe('useShellCommandProcessor', () => {
-  let spawnEmitter: EventEmitter;
+  // FIX: Define a more specific type for our mock process
+  let spawnEmitter: EventEmitter & {
+    stdout: EventEmitter;
+    stderr: EventEmitter;
+  };
   let addItemToHistoryMock: vi.Mock;
   let setPendingHistoryItemMock: vi.Mock;
   let onExecMock: vi.Mock;
@@ -36,9 +42,16 @@ describe('useShellCommandProcessor', () => {
   let configMock: Config;
   let geminiClientMock: GeminiClient;
 
+  // Define the wrapper for the hook
+  const wrapper = ({ children }: { children: React.ReactNode }) => (
+    <SudoProvider>{children}</SudoProvider>
+  );
+
   beforeEach(async () => {
     const { spawn } = await import('child_process');
-    spawnEmitter = new EventEmitter();
+    
+    // FIX: Cast the base EventEmitter to 'any' to allow adding properties
+    spawnEmitter = new EventEmitter() as any;
     spawnEmitter.stdout = new EventEmitter();
     spawnEmitter.stderr = new EventEmitter();
     (spawn as vi.Mock).mockReturnValue(spawnEmitter);
@@ -66,15 +79,17 @@ describe('useShellCommandProcessor', () => {
   });
 
   const renderProcessorHook = () =>
-    renderHook(() =>
-      useShellCommandProcessor(
-        addItemToHistoryMock,
-        setPendingHistoryItemMock,
-        onExecMock,
-        onDebugMessageMock,
-        configMock,
-        geminiClientMock,
-      ),
+    renderHook(
+      () =>
+        useShellCommandProcessor(
+          addItemToHistoryMock,
+          setPendingHistoryItemMock,
+          onExecMock,
+          onDebugMessageMock,
+          configMock,
+          geminiClientMock,
+        ),
+      { wrapper },
     );
 
   it('should execute a command and update history on success', async () => {
