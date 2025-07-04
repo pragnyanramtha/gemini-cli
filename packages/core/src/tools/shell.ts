@@ -20,20 +20,19 @@ import {
 import { SchemaValidator } from '../utils/schemaValidator.js';
 import { getErrorMessage } from '../utils/errors.js';
 import stripAnsi from 'strip-ansi';
+import { spawn, SpawnOptions } from 'child_process';
+
+const OUTPUT_UPDATE_INTERVAL_MS = 1000;
 
 export interface ShellToolParams {
   command: string;
   description?: string;
   directory?: string;
 }
-import { spawn, SpawnOptions } from 'child_process';
-
-const OUTPUT_UPDATE_INTERVAL_MS = 1000;
 
 export class ShellTool extends BaseTool<ShellToolParams, ToolResult> {
   static Name: string = 'run_shell_command';
   private whitelist: Set<string> = new Set();
-
   private sudoPassword?: string;
   private sudoPasswordTimestamp?: number;
   private readonly SUDO_CACHE_DURATION_MS = 15 * 60 * 1000; // 15 minutes
@@ -82,71 +81,34 @@ Process Group PGID: Process group started or \`(none)\``,
 
   getDescription(params: ShellToolParams): string {
     let description = `${params.command}`;
-    // append optional [in directory]
-    // note description is needed even if validation fails due to absolute path
     if (params.directory) {
       description += ` [in ${params.directory}]`;
     }
-    // append optional (description), replacing any line breaks with spaces
     if (params.description) {
       description += ` (${params.description.replace(/\n/g, ' ')})`;
     }
     return description;
   }
 
-  /**
-   * Extracts the root command from a given shell command string.
-   * This is used to identify the base command for permission checks.
-   *
-   * @param command The shell command string to parse
-   * @returns The root command name, or undefined if it cannot be determined
-   * @example getCommandRoot("ls -la /tmp") returns "ls"
-   * @example getCommandRoot("git status && npm test") returns "git"
-   */
   getCommandRoot(command: string): string | undefined {
     return command
-      .trim() // remove leading and trailing whitespace
-      .replace(/[{}()]/g, '') // remove all grouping operators
-      .split(/[\s;&|]+/)[0] // split on any whitespace or separator or chaining operators and take first part
-      ?.split(/[/\\]/) // split on any path separators (or return undefined if previous line was undefined)
-      .pop(); // take last part and return command root (or undefined if previous line was empty)
+      .trim()
+      .replace(/[{}()]/g, '')
+      .split(/[\s;&|]+/)[0]
+      ?.split(/[/\\]/)
+      .pop();
   }
 
-  /**
-   * Determines whether a given shell command is allowed to execute based on
-   * the tool's configuration including allowlists and blocklists.
-   *
-   * @param command The shell command string to validate
-   * @returns True if the command is allowed to execute, false otherwise
-   */
   isCommandAllowed(command: string): boolean {
-    // 0. Disallow command substitution
     if (command.includes('$(') || command.includes('`')) {
       return false;
     }
-
     const SHELL_TOOL_NAMES = [ShellTool.name, ShellTool.Name];
-
     const normalize = (cmd: string): string => cmd.trim().replace(/\s+/g, ' ');
-
-    /**
-     * Checks if a command string starts with a given prefix, ensuring it's a
-     * whole word match (i.e., followed by a space or it's an exact match).
-     * e.g., `isPrefixedBy('npm install', 'npm')` -> true
-     * e.g., `isPrefixedBy('npm', 'npm')` -> true
-     * e.g., `isPrefixedBy('npminstall', 'npm')` -> false
-     */
     const isPrefixedBy = (cmd: string, prefix: string): boolean => {
-      if (!cmd.startsWith(prefix)) {
-        return false;
-      }
+      if (!cmd.startsWith(prefix)) return false;
       return cmd.length === prefix.length || cmd[prefix.length] === ' ';
     };
-
-    /**
-     * Extracts and normalizes shell commands from a list of tool strings.
-     * e.g., 'ShellTool("ls -l")' becomes 'ls -l'
-     */
     const extractCommands = (tools: string[]): string[] =>
       tools.flatMap((tool) => {
         for (const toolName of SHELL_TOOL_NAMES) {
@@ -156,48 +118,32 @@ Process Group PGID: Process group started or \`(none)\``,
         }
         return [];
       });
-
     const coreTools = this.config.getCoreTools() || [];
     const excludeTools = this.config.getExcludeTools() || [];
-
-    // 1. Check if the shell tool is globally disabled.
     if (SHELL_TOOL_NAMES.some((name) => excludeTools.includes(name))) {
       return false;
     }
-
     const blockedCommands = new Set(extractCommands(excludeTools));
     const allowedCommands = new Set(extractCommands(coreTools));
-
     const hasSpecificAllowedCommands = allowedCommands.size > 0;
     const isWildcardAllowed = SHELL_TOOL_NAMES.some((name) =>
       coreTools.includes(name),
     );
-
     const commandsToValidate = command.split(/&&|\|\||\||;/).map(normalize);
-
     for (const cmd of commandsToValidate) {
-      // 2. Check if the command is on the blocklist.
       const isBlocked = [...blockedCommands].some((blocked) =>
         isPrefixedBy(cmd, blocked),
       );
-      if (isBlocked) {
-        return false;
-      }
-
-      // 3. If in strict allow-list mode, check if the command is permitted.
+      if (isBlocked) return false;
       const isStrictAllowlist =
         hasSpecificAllowedCommands && !isWildcardAllowed;
       if (isStrictAllowlist) {
         const isAllowed = [...allowedCommands].some((allowed) =>
           isPrefixedBy(cmd, allowed),
         );
-        if (!isAllowed) {
-          return false;
-        }
+        if (!isAllowed) return false;
       }
     }
-
-    // 4. If all checks pass, the command is allowed.
     return true;
   }
 
@@ -239,9 +185,9 @@ Process Group PGID: Process group started or \`(none)\``,
     _abortSignal: AbortSignal,
   ): Promise<ToolCallConfirmationDetails | false> {
     if (this.validateToolParams(params)) {
-      return false; // skip confirmation, execute call will fail immediately
+      return false;
     }
-    const rootCommand = this.getCommandRoot(params.command)!; // must be non-empty string post-validation
+    const rootCommand = this.getCommandRoot(params.command)!;
 
     const isSudo = params.command.trim().startsWith('sudo ');
     const isWindows = os.platform() === 'win32';
@@ -252,7 +198,6 @@ Process Group PGID: Process group started or \`(none)\``,
         Date.now() - this.sudoPasswordTimestamp < this.SUDO_CACHE_DURATION_MS;
 
       if (!isPasswordCached) {
-        // Password is required but not cached, so we prompt the user.
         const confirmationDetails: ToolPasswordConfirmationDetails = {
           type: 'password',
           title: 'Sudo Password Required',
@@ -267,7 +212,7 @@ Process Group PGID: Process group started or \`(none)\``,
     }
 
     if (this.whitelist.has(rootCommand)) {
-      return false; // already approved and whitelisted
+      return false;
     }
     const confirmationDetails: ToolExecuteConfirmationDetails = {
       type: 'exec',
@@ -291,10 +236,7 @@ Process Group PGID: Process group started or \`(none)\``,
     const validationError = this.validateToolParams(params);
     if (validationError) {
       return {
-        llmContent: [
-          `Command rejected: ${params.command}`,
-          `Reason: ${validationError}`,
-        ].join('\n'),
+        llmContent: `Command rejected: ${params.command}\nReason: ${validationError}`,
         returnDisplay: `Error: ${validationError}`,
       };
     }
@@ -310,12 +252,6 @@ Process Group PGID: Process group started or \`(none)\``,
     const isSudoCommand = !isWindows && params.command.trim().startsWith('sudo ');
     let commandToExecute = params.command;
 
-    const spawnOptions: SpawnOptions = {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: !isWindows,
-      cwd: path.resolve(this.config.getTargetDir(), params.directory || ''),
-    };
-
     if (isSudoCommand) {
       const isPasswordCached =
         this.sudoPassword &&
@@ -324,41 +260,38 @@ Process Group PGID: Process group started or \`(none)\``,
 
       if (!isPasswordCached) {
         return {
-          llmContent:
-            'Sudo command rejected: password has not been provided or has expired.',
+          llmContent: 'Sudo command rejected: password has not been provided or has expired.',
           returnDisplay: 'Error: Sudo password required.',
         };
       }
-      // Replace "sudo" with "sudo -S" and prepare to pipe the password
-      commandToExecute = 'sudo -S ' + params.command.trim().substring(5);
-      spawnOptions.stdio = ['pipe', 'pipe', 'pipe'];
+      
+      const userCommand = params.command.trim();
+      // Securely escape the password for shell usage
+      const escapedPassword = this.sudoPassword!.replace(/'/g, "'\\''");
+      commandToExecute = `echo '${escapedPassword}' | ${userCommand.replace('sudo', 'sudo -S --')}`;
     }
 
-    const tempFileName = `shell_pgrep_${crypto
-      .randomBytes(6)
-      .toString('hex')}.tmp`;
+    const spawnOptions: SpawnOptions = {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: !isWindows,
+      cwd: path.resolve(this.config.getTargetDir(), params.directory || ''),
+    };
+
+    const tempFileName = `shell_pgrep_${crypto.randomBytes(6).toString('hex')}.tmp`;
     const tempFilePath = path.join(os.tmpdir(), tempFileName);
 
-    // pgrep is not available on Windows, so we can't get background PIDs
-    // FIX: Use `commandToExecute` here so the `sudo -S` version is used.
     const command = isWindows
       ? commandToExecute
       : (() => {
-          let cmd = commandToExecute.trim();
-          if (!cmd.endsWith('&')) cmd += ';';
+          let cmd = commandToExecute;
+          // The pgrep wrapper should now enclose the entire secure command
+          if (!cmd.trim().endsWith('&')) cmd += ';';
           return `{ ${cmd} }; __code=$?; pgrep -g 0 >${tempFilePath} 2>&1; exit $__code;`;
         })();
 
-    // FIX: Pass the configured `spawnOptions` to the spawn call.
     const shell = isWindows
       ? spawn('cmd.exe', ['/c', command], spawnOptions)
       : spawn('bash', ['-c', command], spawnOptions);
-
-    // FIX: Pipe the password to stdin for sudo commands.
-    if (isSudoCommand && shell.stdin) {
-      shell.stdin.write(this.sudoPassword + '\n');
-      shell.stdin.end();
-    }
 
     let exited = false;
     let stdout = '';
@@ -380,6 +313,11 @@ Process Group PGID: Process group started or \`(none)\``,
       shell.stdout.on('data', (data: Buffer) => {
         if (!exited) {
           const str = stripAnsi(data.toString());
+          // Check for sudo error message and clear the bad password
+          if (str.includes('sudo: a password is required') || str.includes('sudo: sorry, try again')) {
+            this.sudoPassword = undefined;
+            this.sudoPasswordTimestamp = undefined;
+          }
           stdout += str;
           appendOutput(str);
         }
@@ -391,6 +329,10 @@ Process Group PGID: Process group started or \`(none)\``,
       shell.stderr.on('data', (data: Buffer) => {
         if (!exited) {
           const str = stripAnsi(data.toString());
+          if (str.includes('sudo: a password is required') || str.includes('sudo: sorry, try again')) {
+            this.sudoPassword = undefined;
+            this.sudoPasswordTimestamp = undefined;
+          }
           stderr += str;
           appendOutput(str);
         }
@@ -400,7 +342,6 @@ Process Group PGID: Process group started or \`(none)\``,
     let error: Error | null = null;
     shell.on('error', (err: Error) => {
       error = err;
-      // remove wrapper from user's command in error message
       error.message = error.message.replace(command, params.command);
     });
 
@@ -419,23 +360,17 @@ Process Group PGID: Process group started or \`(none)\``,
     const abortHandler = async () => {
       if (shell.pid && !exited) {
         if (os.platform() === 'win32') {
-          // For Windows, use taskkill to kill the process tree
           spawn('taskkill', ['/pid', shell.pid.toString(), '/f', '/t']);
         } else {
           try {
-            // attempt to SIGTERM process group (negative PID)
-            // fall back to SIGKILL (to group) after 200ms
             process.kill(-shell.pid, 'SIGTERM');
             await new Promise((resolve) => setTimeout(resolve, 200));
             if (shell.pid && !exited) {
               process.kill(-shell.pid, 'SIGKILL');
             }
           } catch (_e) {
-            // if group kill fails, fall back to killing just the main process
             try {
-              if (shell.pid) {
-                shell.kill('SIGKILL');
-              }
+              if (shell.pid) shell.kill('SIGKILL');
             } catch (_e) {
               console.error(`failed to kill shell process ${shell.pid}: ${_e}`);
             }
@@ -445,27 +380,21 @@ Process Group PGID: Process group started or \`(none)\``,
     };
     abortSignal.addEventListener('abort', abortHandler);
 
-    // wait for the shell to exit
     try {
       await new Promise((resolve) => shell.on('exit', resolve));
     } finally {
       abortSignal.removeEventListener('abort', abortHandler);
     }
 
-    // parse pids (pgrep output) from temporary file and remove it
     const backgroundPIDs: number[] = [];
     if (os.platform() !== 'win32') {
       if (fs.existsSync(tempFilePath)) {
-        const pgrepLines = fs
-          .readFileSync(tempFilePath, 'utf8')
-          .split('\n')
-          .filter(Boolean);
+        const pgrepLines = fs.readFileSync(tempFilePath, 'utf8').split('\n').filter(Boolean);
         for (const line of pgrepLines) {
           if (!/^\d+$/.test(line)) {
             console.error(`pgrep: ${line}`);
           }
           const pid = Number(line);
-          // exclude the shell subprocess pid
           if (pid !== shell.pid) {
             backgroundPIDs.push(pid);
           }
@@ -507,19 +436,15 @@ Process Group PGID: Process group started or \`(none)\``,
       if (output.trim()) {
         returnDisplayMessage = output;
       } else {
-        // Output is empty, let's provide a reason if the command failed or was cancelled
         if (abortSignal.aborted) {
           returnDisplayMessage = 'Command cancelled by user.';
         } else if (processSignal) {
           returnDisplayMessage = `Command terminated by signal: ${processSignal}`;
         } else if (error) {
-          // If error is not null, it's an Error object (or other truthy value)
           returnDisplayMessage = `Command failed: ${getErrorMessage(error)}`;
         } else if (code !== null && code !== 0) {
           returnDisplayMessage = `Command exited with code: ${code}`;
         }
-        // If output is empty and command succeeded (code 0, no error/signal/abort),
-        // returnDisplayMessage will remain empty, which is fine.
       }
     }
 

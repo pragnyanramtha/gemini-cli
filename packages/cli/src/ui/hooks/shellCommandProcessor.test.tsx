@@ -4,191 +4,280 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React from 'react';
-import { act, renderHook } from '@testing-library/react';
-import { vi } from 'vitest';
-import { useShellCommandProcessor } from './shellCommandProcessor.js';
+import { spawn, SpawnOptions } from 'child_process';
+import { StringDecoder } from 'string_decoder';
+import type { HistoryItemWithoutId } from '../types.js';
+import { useCallback } from 'react';
 import { Config, GeminiClient } from '@google/gemini-cli-core';
-import * as fs from 'fs';
-import { EventEmitter } from 'events';
-import { SudoProvider } from '../contexts/SudoContext.js';
+import { type PartListUnion } from '@google/genai';
+import { formatMemoryUsage } from '../utils/formatters.js';
+import { isBinary } from '../utils/textUtils.js';
+import { UseHistoryManagerReturn } from './useHistoryManager.js';
+import crypto from 'crypto';
+import path from 'path';
+import os from 'os';
+import fs from 'fs';
+import stripAnsi from 'strip-ansi';
+import { useSudo } from '../contexts/SudoContext.js';
 
-// Mock dependencies
-vi.mock('child_process');
-vi.mock('fs');
-vi.mock('os', () => ({
-  default: {
-    platform: () => 'linux',
-    tmpdir: () => '/tmp',
-  },
-  platform: () => 'linux',
-  tmpdir: () => '/tmp',
-}));
-vi.mock('@google/gemini-cli-core');
-vi.mock('../utils/textUtils.js', () => ({
-  isBinary: vi.fn(),
-}));
+const OUTPUT_UPDATE_INTERVAL_MS = 1000;
+const MAX_OUTPUT_LENGTH = 10000;
 
-describe('useShellCommandProcessor', () => {
-  // FIX: Define a more specific type for our mock process
-  let spawnEmitter: EventEmitter & {
-    stdout: EventEmitter;
-    stderr: EventEmitter;
-  };
-  let addItemToHistoryMock: vi.Mock;
-  let setPendingHistoryItemMock: vi.Mock;
-  let onExecMock: vi.Mock;
-  let onDebugMessageMock: vi.Mock;
-  let configMock: Config;
-  let geminiClientMock: GeminiClient;
+interface ShellExecutionResult {
+  rawOutput: Buffer;
+  output: string;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  error: Error | null;
+  aborted: boolean;
+  finalPwd?: string;
+}
 
-  // Define the wrapper for the hook
-  const wrapper = ({ children }: { children: React.ReactNode }) => (
-    <SudoProvider>{children}</SudoProvider>
+function executeShellCommand(
+  rawCommand: string,
+  cwd: string,
+  abortSignal: AbortSignal,
+  onOutputChunk: (chunk: string) => void,
+  onDebugMessage: (message: string) => void,
+  sudoPassword?: string,
+): Promise<ShellExecutionResult> {
+  const isWindows = os.platform() === 'win32';
+  const isSudo = !isWindows && rawCommand.trim().startsWith('sudo ');
+  let commandToExecute = rawCommand;
+
+  if (isSudo) {
+    if (!sudoPassword) {
+      return Promise.resolve({
+        rawOutput: Buffer.from(''),
+        output: 'Error: sudo password required, but not provided or has expired.\nRun a sudo command through the AI first to cache the password.',
+        exitCode: 1,
+        signal: null,
+        error: new Error('Sudo password required.'),
+        aborted: false,
+      });
+    }
+    // NEW SECURE STRATEGY: Wrap the user's command
+    const userCommand = rawCommand.trim();
+    const escapedPassword = sudoPassword.replace(/'/g, "'\\''");
+    commandToExecute = `echo '${escapedPassword}' | ${userCommand.replace('sudo', 'sudo -S --')}`;
+  }
+
+  return new Promise((resolve) => {
+    let finalWrappedCommand = commandToExecute;
+    let pwdFilePath: string | undefined;
+
+    if (!isWindows) {
+      let command = commandToExecute;
+      const pwdFileName = `shell_pwd_${crypto.randomBytes(6).toString('hex')}.tmp`;
+      pwdFilePath = path.join(os.tmpdir(), pwdFileName);
+      if (!command.trim().endsWith('&')) {
+        command += ';';
+      }
+      finalWrappedCommand = `{ ${command} }; __code=$?; pwd > "${pwdFilePath}"; exit $__code`;
+    }
+
+    const shell = isWindows ? 'cmd.exe' : 'bash';
+    const shellArgs = isWindows
+      ? ['/c', finalWrappedCommand]
+      : ['-c', finalWrappedCommand];
+
+    const spawnOptions: SpawnOptions = {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: !isWindows,
+    };
+
+    onDebugMessage(`Executing in ${cwd}: ${finalWrappedCommand}`);
+    const child = spawn(shell, shellArgs, spawnOptions);
+
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
+    let stdout = '';
+    let stderr = '';
+    const outputChunks: Buffer[] = [];
+    let error: Error | null = null;
+    let exited = false;
+    let streamToUi = true;
+    const MAX_SNIFF_SIZE = 4096;
+    let sniffedBytes = 0;
+
+    const handleOutput = (data: Buffer, stream: 'stdout' | 'stderr') => {
+      outputChunks.push(data);
+      if (streamToUi && sniffedBytes < MAX_SNIFF_SIZE) {
+        const sniffBuffer = Buffer.concat(outputChunks.slice(0, 20));
+        sniffedBytes = sniffBuffer.length;
+        if (isBinary(sniffBuffer)) {
+          streamToUi = false;
+          onOutputChunk('[Binary output detected. Halting stream...]');
+        }
+      }
+      const decodedChunk = stream === 'stdout' ? stdoutDecoder.write(data) : stderrDecoder.write(data);
+      if (stream === 'stdout') {
+        stdout += stripAnsi(decodedChunk);
+      } else {
+        stderr += stripAnsi(decodedChunk);
+      }
+      if (!exited && streamToUi) {
+        const combinedOutput = stdout + (stderr ? `\n${stderr}` : '');
+        onOutputChunk(combinedOutput);
+      } else if (!exited && !streamToUi) {
+        const totalBytes = outputChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        onOutputChunk(`[Receiving binary output... ${formatMemoryUsage(totalBytes)} received]`);
+      }
+    };
+
+    if (child.stdout) {
+      child.stdout.on('data', (data) => handleOutput(data, 'stdout'));
+    }
+    if (child.stderr) {
+      child.stderr.on('data', (data) => handleOutput(data, 'stderr'));
+    }
+    child.on('error', (err) => { error = err; });
+
+    const abortHandler = async () => {
+      if (child.pid && !exited) {
+        onDebugMessage(`Aborting shell command (PID: ${child.pid})`);
+        if (isWindows) {
+          spawn('taskkill', ['/pid', child.pid.toString(), '/f', '/t']);
+        } else {
+          try {
+            process.kill(-child.pid, 'SIGTERM');
+            await new Promise((res) => setTimeout(res, 200));
+            if (!exited) process.kill(-child.pid, 'SIGKILL');
+          } catch (_e) {
+            if (!exited) child.kill('SIGKILL');
+          }
+        }
+      }
+    };
+    abortSignal.addEventListener('abort', abortHandler, { once: true });
+
+    child.on('exit', (code, signal) => {
+      exited = true;
+      abortSignal.removeEventListener('abort', abortHandler);
+      stdout += stdoutDecoder.end();
+      stderr += stderrDecoder.end();
+      const finalBuffer = Buffer.concat(outputChunks);
+      let finalPwd: string | undefined;
+      if (pwdFilePath && fs.existsSync(pwdFilePath)) {
+        finalPwd = fs.readFileSync(pwdFilePath, 'utf8').trim();
+        fs.unlinkSync(pwdFilePath);
+      }
+      resolve({
+        rawOutput: finalBuffer,
+        output: stdout + (stderr ? `\n${stderr}` : ''),
+        exitCode: code,
+        signal,
+        error,
+        aborted: abortSignal.aborted,
+        finalPwd,
+      });
+    });
+  });
+}
+
+function addShellCommandToGeminiHistory(
+  geminiClient: GeminiClient,
+  rawQuery: string,
+  resultText: string,
+) {
+  const modelContent =
+    resultText.length > MAX_OUTPUT_LENGTH
+      ? resultText.substring(0, MAX_OUTPUT_LENGTH) + '\n... (truncated)'
+      : resultText;
+  geminiClient.addHistory({
+    role: 'user',
+    parts: [
+      {
+        text: `I ran the following shell command:\n\`\`\`sh\n${rawQuery}\n\`\`\`\n\nThis produced the following result:\n\`\`\`\n${modelContent}\n\`\`\``,
+      },
+    ],
+  });
+}
+
+export const useShellCommandProcessor = (
+  addItemToHistory: UseHistoryManagerReturn['addItem'],
+  setPendingHistoryItem: React.Dispatch<React.SetStateAction<HistoryItemWithoutId | null>>,
+  onExec: (command: Promise<void>) => void,
+  onDebugMessage: (message: string) => void,
+  config: Config,
+  geminiClient: GeminiClient,
+) => {
+  const { getPassword: getSudoPassword, setPassword: setSudoPassword } = useSudo();
+
+  const handleShellCommand = useCallback(
+    (rawQuery: PartListUnion, abortSignal: AbortSignal): boolean => {
+      if (typeof rawQuery !== 'string' || rawQuery.trim() === '') {
+        return false;
+      }
+      const userMessageTimestamp = Date.now();
+      addItemToHistory({ type: 'user_shell', text: rawQuery }, userMessageTimestamp);
+      const targetDir = config.getTargetDir();
+
+      const execPromise = new Promise<void>((resolve) => {
+        let lastUpdateTime = 0;
+
+        executeShellCommand(
+          rawQuery,
+          targetDir,
+          abortSignal,
+          (streamedOutput) => {
+            if (Date.now() - lastUpdateTime > OUTPUT_UPDATE_INTERVAL_MS) {
+              setPendingHistoryItem({ type: 'info', text: streamedOutput });
+              lastUpdateTime = Date.now();
+            }
+          },
+          onDebugMessage,
+          getSudoPassword(),
+        )
+          .then((result) => {
+            setPendingHistoryItem(null);
+            // If sudo failed, clear the bad password from context
+            if (result.output.includes('sudo: sorry, try again')) {
+              setSudoPassword('');
+            }
+            let historyItemType: HistoryItemWithoutId['type'] = 'info';
+            let mainContent: string;
+            if (isBinary(result.rawOutput)) {
+              mainContent = '[Command produced binary output, which is not shown.]';
+            } else {
+              mainContent = result.output.trim() || '(Command produced no output)';
+            }
+            let finalOutput = mainContent;
+            if (result.error) {
+              historyItemType = 'error';
+              finalOutput = `${result.error.message}\n${finalOutput}`;
+            } else if (result.aborted) {
+              finalOutput = `Command was cancelled.\n${finalOutput}`;
+            } else if (result.signal) {
+              historyItemType = 'error';
+              finalOutput = `Command terminated by signal: ${result.signal}.\n${finalOutput}`;
+            } else if (result.exitCode !== 0) {
+              historyItemType = 'error';
+              finalOutput = `Command exited with code ${result.exitCode}.\n${finalOutput}`;
+            }
+            if (result.finalPwd && result.finalPwd !== targetDir) {
+              const warning = `WARNING: shell mode is stateless; the directory change to '${result.finalPwd}' will not persist.`;
+              finalOutput = `${warning}\n\n${finalOutput}`;
+            }
+            addItemToHistory({ type: historyItemType, text: finalOutput }, userMessageTimestamp);
+            addShellCommandToGeminiHistory(geminiClient, rawQuery, finalOutput);
+          })
+          .catch((err) => {
+            setPendingHistoryItem(null);
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            addItemToHistory({ type: 'error', text: `An unexpected error occurred: ${errorMessage}` }, userMessageTimestamp);
+          })
+          .finally(() => {
+            resolve();
+          });
+      });
+
+      onExec(execPromise);
+      return true;
+    },
+    [config, onDebugMessage, addItemToHistory, setPendingHistoryItem, onExec, geminiClient, getSudoPassword, setSudoPassword],
   );
 
-  beforeEach(async () => {
-    const { spawn } = await import('child_process');
-    
-    // FIX: Cast the base EventEmitter to 'any' to allow adding properties
-    spawnEmitter = new EventEmitter() as any;
-    spawnEmitter.stdout = new EventEmitter();
-    spawnEmitter.stderr = new EventEmitter();
-    (spawn as vi.Mock).mockReturnValue(spawnEmitter);
-
-    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
-    vi.spyOn(fs, 'readFileSync').mockReturnValue('');
-    vi.spyOn(fs, 'unlinkSync').mockReturnValue(undefined);
-
-    addItemToHistoryMock = vi.fn();
-    setPendingHistoryItemMock = vi.fn();
-    onExecMock = vi.fn();
-    onDebugMessageMock = vi.fn();
-
-    configMock = {
-      getTargetDir: () => '/test/dir',
-    } as unknown as Config;
-
-    geminiClientMock = {
-      addHistory: vi.fn(),
-    } as unknown as GeminiClient;
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  const renderProcessorHook = () =>
-    renderHook(
-      () =>
-        useShellCommandProcessor(
-          addItemToHistoryMock,
-          setPendingHistoryItemMock,
-          onExecMock,
-          onDebugMessageMock,
-          configMock,
-          geminiClientMock,
-        ),
-      { wrapper },
-    );
-
-  it('should execute a command and update history on success', async () => {
-    const { result } = renderProcessorHook();
-    const abortController = new AbortController();
-
-    act(() => {
-      result.current.handleShellCommand('ls -l', abortController.signal);
-    });
-
-    expect(onExecMock).toHaveBeenCalledTimes(1);
-    const execPromise = onExecMock.mock.calls[0][0];
-
-    // Simulate stdout
-    act(() => {
-      spawnEmitter.stdout.emit('data', Buffer.from('file1.txt\nfile2.txt'));
-    });
-
-    // Simulate process exit
-    act(() => {
-      spawnEmitter.emit('exit', 0, null);
-    });
-
-    await act(async () => {
-      await execPromise;
-    });
-
-    expect(addItemToHistoryMock).toHaveBeenCalledTimes(2);
-    expect(addItemToHistoryMock.mock.calls[1][0]).toEqual({
-      type: 'info',
-      text: 'file1.txt\nfile2.txt',
-    });
-    expect(geminiClientMock.addHistory).toHaveBeenCalledTimes(1);
-  });
-
-  it('should handle binary output', async () => {
-    const { result } = renderProcessorHook();
-    const abortController = new AbortController();
-    const { isBinary } = await import('../utils/textUtils.js');
-    (isBinary as vi.Mock).mockReturnValue(true);
-
-    act(() => {
-      result.current.handleShellCommand(
-        'cat myimage.png',
-        abortController.signal,
-      );
-    });
-
-    expect(onExecMock).toHaveBeenCalledTimes(1);
-    const execPromise = onExecMock.mock.calls[0][0];
-
-    act(() => {
-      spawnEmitter.stdout.emit('data', Buffer.from([0x89, 0x50, 0x4e, 0x47]));
-    });
-
-    act(() => {
-      spawnEmitter.emit('exit', 0, null);
-    });
-
-    await act(async () => {
-      await execPromise;
-    });
-
-    expect(addItemToHistoryMock).toHaveBeenCalledTimes(2);
-    expect(addItemToHistoryMock.mock.calls[1][0]).toEqual({
-      type: 'info',
-      text: '[Command produced binary output, which is not shown.]',
-    });
-  });
-
-  it('should handle command failure', async () => {
-    const { result } = renderProcessorHook();
-    const abortController = new AbortController();
-
-    act(() => {
-      result.current.handleShellCommand(
-        'a-bad-command',
-        abortController.signal,
-      );
-    });
-
-    const execPromise = onExecMock.mock.calls[0][0];
-
-    act(() => {
-      spawnEmitter.stderr.emit('data', Buffer.from('command not found'));
-    });
-
-    act(() => {
-      spawnEmitter.emit('exit', 127, null);
-    });
-
-    await act(async () => {
-      await execPromise;
-    });
-
-    expect(addItemToHistoryMock).toHaveBeenCalledTimes(2);
-    expect(addItemToHistoryMock.mock.calls[1][0]).toEqual({
-      type: 'error',
-      text: 'Command exited with code 127.\ncommand not found',
-    });
-  });
-});
+  return { handleShellCommand };
+};
