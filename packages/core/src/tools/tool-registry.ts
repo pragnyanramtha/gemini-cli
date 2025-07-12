@@ -11,6 +11,7 @@ import { spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { discoverMcpTools } from './mcp-client.js';
 import { DiscoveredMCPTool } from './mcp-tool.js';
+import { defaultSummarizer } from '../utils/summarizer.js';
 import { parse } from 'shell-quote';
 
 type ToolParams = Record<string, unknown>;
@@ -47,6 +48,7 @@ Signal: Signal number or \`(none)\` if no signal was received.
       parameterSchema,
       false, // isOutputMarkdown
       false, // canUpdateOutput
+      defaultSummarizer,
     );
   }
 
@@ -125,7 +127,6 @@ Signal: Signal number or \`(none)\` if no signal was received.
 
 export class ToolRegistry {
   private tools: Map<string, Tool> = new Map();
-  private discovery: Promise<void> | null = null;
   private config: Config;
 
   constructor(config: Config) {
@@ -155,8 +156,6 @@ export class ToolRegistry {
     for (const tool of this.tools.values()) {
       if (tool instanceof DiscoveredTool || tool instanceof DiscoveredMCPTool) {
         this.tools.delete(tool.name);
-      } else {
-        // Keep manually registered tools
       }
     }
 

@@ -17,7 +17,8 @@
     "node_modules",
     "dist",
     "src/**/*.test.ts",
-    "src/**/*.test.tsx" 
+    "src/**/*.test.tsx",
+    "src/test-utils"
   ],
   "references": [{ "path": "../core" }]
 }
