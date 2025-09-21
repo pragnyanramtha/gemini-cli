@@ -2,7 +2,8 @@
 .env
 .env~
 
-
+.
+.autocommit-hash
 .kiro/
 # gemini-cli settings
 # We want to keep the .gemini in the root of the repo and ignore any .gemini
